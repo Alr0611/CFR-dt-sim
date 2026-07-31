@@ -83,7 +83,7 @@ custom pair both work.
 
 ## Python tools (run in a terminal at the repo root, not MATLAB)
 
-Only needed for the competitor-benchmarking work; the MATLAB analyses don't require them.
+Only needed for data etc; the MATLAB analyses don't require them.
 
 | Command | What it does |
 |---|---|
