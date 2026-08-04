@@ -30,7 +30,7 @@ Everything a script produces (figures + CSVs) lands in the **`output/`** folder.
 | Endurance driveline torque spectrum | `fatigue_spectrum` | Load spectrum for fatigue |
 | Accel driveline torque spectrum (the fatigue case) | `accel_fatigue` | Launch load spectrum |
 | Braking / no-regen energy check | `brake_analysis` | Brake heat + energy lost with no regen |
-| Our model vs MEASURED efficiency | `efficiency_crosscheck` | Model-vs-telemetry comparison |
+| Physics model vs MEASURED efficiency | `efficiency_crosscheck` | Model-vs-telemetry comparison |
 
 ---
 
