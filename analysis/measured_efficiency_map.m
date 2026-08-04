@@ -4,20 +4,32 @@ function M = measured_efficiency_map(rpm, torque, packV, packI, varargin)
 %   M = measured_efficiency_map(rpm, torque, packV, packI)
 %   M = measured_efficiency_map(..., 'keep', steadyMask, 'minSamples', 30)
 %
-% WHERE THIS COMES FROM
-%   This is the method from freeman803/Full-Car-Simulation, branch
-%   user/af/dteff (Drive_efficiency.m): instantaneous efficiency =
-%   mechanical power / pack electrical power, averaged into a 10x10
-%   torque-vs-speed grid. Their file builds the grid with 100 hand-written
-%   masks; this is the same math vectorized, so the grid is configurable
-%   and reusable against any telemetry export.
+% THE METHOD, IN FULL (nobody should have to ask a person what this is)
+%   Measured efficiency, binned. For every logged sample:
+%       instantaneous efficiency = mechanical power OUT / electrical power IN
+%                                = (motor torque x motor speed) / (pack V x pack I)
+%   Those per-sample efficiencies are averaged into a 10x10 grid of torque vs
+%   speed, so efficiency comes out as a MAP rather than a single number. Bins
+%   with too few samples are returned NaN instead of reported thin.
+%   No physics model anywhere in here -- this is only what the car actually did.
+%   (Adapted from a reference implementation that built the same grid with 100
+%   hand-written masks; this is the same math vectorized, so the grid is
+%   configurable and reusable against any telemetry export.)
 %
 % ONE IMPORTANT HONESTY NOTE (verified against our June 20 comp data)
-%   The driveline is rigid, so axle speed = motor rpm / gear ratio. Their
-%   "wheel power" = axleSpeed * (motorTorque * 4.6) -- the ratio cancels and
+%   The driveline is rigid, so axle speed = motor rpm / gear ratio. If you form
+%   "wheel power" as axleSpeed * (motorTorque * ratio), the ratio CANCELS and
 %   what's left is MOTOR SHAFT power. So this map is MOTOR + INVERTER
 %   efficiency (pack -> shaft). It does NOT see the gearbox/chain/diff
 %   losses (that's p.eta_drivetrain, a separate number).
+%
+% THIRD HONESTY NOTE -- "MEASURED" IS DOING SOME WORK IN THAT WORD
+%   The torque channel (PM100DX_torqueFeedback) is the INVERTER'S OWN ESTIMATE
+%   of torque, derived from measured current through its internal motor model.
+%   It is not a torque transducer. So the mechanical side of this "measured"
+%   map is partly MODEL-DERIVED, and shares assumptions (notably Kt) with the
+%   physics model it gets compared against. A shaft torque transducer on a dyno
+%   is what would make this an actual independent measurement.
 %
 % SECOND HONESTY NOTE
 %   Race telemetry is nearly all transients. During accel, pack power also
@@ -34,13 +46,13 @@ function M = measured_efficiency_map(rpm, torque, packV, packI, varargin)
 %   .tqCenters    torque bin centers (Nm)
 %   .rpmCenters   speed band centers (rpm)
 %   .eff_overall  energy-weighted overall eff, sum(mech)/sum(elec) -- the
-%                 single number the af/dteff script prints as "mean eff"
+%                 single number this method reports as its overall "mean eff"
 %   .point.eff    per-sample instantaneous efficiency (all samples)
 %   .point.keep   the motoring mask actually used
 
 ip = inputParser;
-ip.addParameter('tqEdges',  2.5:15:152.5);   % af/dteff grid: 10 torque bins
-ip.addParameter('rpmEdges', 15:600:6015);    % af/dteff grid: 10 speed bands
+ip.addParameter('tqEdges',  2.5:15:152.5);   % 10 torque bins (reference grid)
+ip.addParameter('rpmEdges', 15:600:6015);    % 10 speed bands (reference grid)
 ip.addParameter('minSamples', 20);           % below this a bin is noise -> NaN
 ip.addParameter('keep', []);                 % optional extra mask (steady-state)
 ip.parse(varargin{:});

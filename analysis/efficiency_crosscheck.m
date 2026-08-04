@@ -1,16 +1,28 @@
-%% EFFICIENCY_CROSSCHECK -- our physics model vs MEASURED efficiency, same data.
+%% EFFICIENCY_CROSSCHECK -- the physics model vs MEASURED efficiency, same data.
 %
-% Two independent ways to get motor efficiency:
-%   1. OURS: physics (copper + iron loss from the EMRAX 208 HV datasheet),
+% Two ways to get motor efficiency (NOT independent -- see the note below):
+%   1. PHYSICS: copper + iron loss from the EMRAX 208 HV datasheet,
 %      lib/emrax208_efficiency.m, times the p.eta_inverter real-world haircut.
-%   2. THEIRS: the af/dteff method -- measure it. Instantaneous (shaft power /
-%      pack power) from telemetry, binned over torque x speed.
-%      Reimplemented in analysis/measured_efficiency_map.m.
-% If two methods that share NO assumptions agree, both are probably right.
-% This script runs the comparison on the June 20 comp session and prints an
-% honest verdict. Expected result (and why the sim uses eta_inverter = 0.95):
+%   2. MEASURED: don't model it, measure it. Per-sample efficiency =
+%      mechanical power out / electrical power in = (motor torque x motor speed)
+%      / (pack V x pack I), binned over torque x speed.
+%      Implemented in analysis/measured_efficiency_map.m.
+%
+% READ THIS BEFORE CALLING IT A VALIDATION. These two are NOT independent:
+%   (a) p.eta_inverter = 0.95 was CHOSEN so that the physics model would land on
+%       this measured number. Of course they agree -- one was fitted to the other.
+%       That makes this a CALIBRATION CHECK, not independent validation.
+%   (b) the 'measured' torque channel (PM100DX_torqueFeedback) is the INVERTER'S
+%       OWN ESTIMATE of torque, from measured current run through its internal
+%       motor model. Not a transducer. So the 'measured' side is partly
+%       model-derived, and shares assumptions (notably Kt) with the physics side.
+% What this script IS good for: catching drift. If someone moves a motor constant
+% or the haircut, these two stop lining up and you find out.
+% What would make it a real validation: a dyno pull with a shaft torque transducer.
+%
+% Expected result (and why the sim uses eta_inverter = 0.95):
 %   - steady-state measured motor+inverter eff ~ 0.86
-%   - our physics (motor only) on the same points  ~ 0.91
+%   - physics (motor only) on the same points  ~ 0.91
 %   - 0.91 x 0.95 = 0.86  -> the haircut closes the gap.
 
 clear; clc;
@@ -27,18 +39,19 @@ packCurrent = crosscheckData.BMSB_packCurrent;
 packPower       = abs(packVoltage.*packCurrent);
 mechanicalPower = motorTorque .* motorSpeed * 2*pi/60;
 
-%% ---- 0. why their map is motor+inverter (the 4.6 cancels) ----
-% Rigid driveline -> axleSpeed = motorRPM/ratio. Their "wheel power" is
-% axleSpeed * motorTorque*4.6 = motor shaft power. Prove the ratio from data:
+%% ---- 0. why the measured map is motor+inverter (the gear ratio cancels) ----
+% Rigid driveline -> axleSpeed = motorRPM/ratio. Forming "wheel power" as
+% axleSpeed * (motorTorque*ratio) gives back motor shaft power -- the ratio
+% cancels. Prove that ratio straight from the data:
 axleSpeed      = abs(crosscheckData.VCREAR_wheelSpeedRL);
 validRatioMask = motorSpeed>500 & axleSpeed>20;
 measuredRatio  = median(motorSpeed(validRatioMask)./axleSpeed(validRatioMask));
 fprintf('measured motor:axle speed ratio = %.3f (gear ratio on car: %.2f)\n', measuredRatio, p.gear_current);
-fprintf('-> af/dteff''s 4.6 cancels out; their map = MOTOR+INVERTER eff.\n\n');
+fprintf('-> the gear ratio cancels out, so the measured map is MOTOR+INVERTER eff.\n\n');
 
-%% ---- 1. the af/dteff map from OUR data (all motoring points) ----
+%% ---- 1. the measured efficiency map from the telemetry (all motoring points) ----
 measuredMapAll = measured_efficiency_map(motorSpeed, motorTorque, packVoltage, packCurrent);
-fprintf('=== MEASURED MAP, all motoring points (af/dteff method) ===\n');
+fprintf('=== MEASURED MAP, all motoring points (mech power out / elec power in) ===\n');
 fprintf('  energy-weighted overall eff : %.3f\n', measuredMapAll.eff_overall);
 fprintf('  populated bins (>=20 pts)   : %d of %d\n\n', nnz(~isnan(measuredMapAll.eff)), numel(measuredMapAll.eff));
 
@@ -66,14 +79,14 @@ if steadyCount < 100   % D3: flag a thin in-band sample
     fprintf('   would firm up this number]\n');
 end
 
-%% ---- 3. our model on the exact same points ----
+%% ---- 3. the physics model on the exact same points ----
 physicsMotorOnly = emrax208_efficiency(motorSpeed, motorTorque, rmfield(p,'eta_inverter'));  % motor physics only
 physicsRealWorld = physicsMotorOnly * p.eta_inverter;                                        % what the sim uses
-fprintf('  our physics (motor only)    = %.3f\n', mean(physicsMotorOnly(steadyMotoringMask)));
+fprintf('  physics (motor only)        = %.3f\n', mean(physicsMotorOnly(steadyMotoringMask)));
 fprintf('  x eta_inverter %.2f         = %.3f\n', p.eta_inverter, mean(physicsRealWorld(steadyMotoringMask)));
 fprintf('  model - measured            = %+.4f\n\n', mean(physicsRealWorld(steadyMotoringMask)) - measuredMotorInverterEff);
 
-%% ---- 4. binned map comparison (model on the same af/dteff grid) ----
+%% ---- 4. binned map comparison (model evaluated on the same measured grid) ----
 torqueEdges = 2.5:15:152.5;  rpmEdges = 15:600:6015;
 torqueBin = discretize(motorTorque, torqueEdges);  speedBin = discretize(motorSpeed, rpmEdges);
 mappedMask = measuredMapAll.point.keep & ~isnan(torqueBin) & ~isnan(speedBin);
@@ -92,10 +105,10 @@ fprintf('   steady-state fit above is the number that means something.)\n');
 %% ---- 5. figure ----
 figHandle = figure('Position',[80 80 1500 420], 'Color','w');
 subplot(1,3,1); surf(measuredMapAll.tqCenters, measuredMapAll.rpmCenters, measuredMapAll.eff.');
-  title('MEASURED (af/dteff method, raw)'); xlabel('Torque (Nm)'); ylabel('Speed (rpm)');
+  title('MEASURED (mech out / elec in, raw)'); xlabel('Torque (Nm)'); ylabel('Speed (rpm)');
   zlabel('\eta'); zlim([.5 1]); shading interp; colorbar; view(135,30);
 subplot(1,3,2); surf(measuredMapAll.tqCenters, measuredMapAll.rpmCenters, physicsMap.');
-  title('OUR MODEL (physics x inverter)'); xlabel('Torque (Nm)'); ylabel('Speed (rpm)');
+  title('PHYSICS MODEL (physics x inverter)'); xlabel('Torque (Nm)'); ylabel('Speed (rpm)');
   zlabel('\eta'); zlim([.5 1]); shading interp; colorbar; view(135,30);
 subplot(1,3,3); surf(measuredMapAll.tqCenters, measuredMapAll.rpmCenters, (physicsMap-measuredMapAll.eff).');
   title('MODEL - MEASURED (transient gap)'); xlabel('Torque (Nm)'); ylabel('Speed (rpm)');
@@ -110,6 +123,8 @@ fprintf('\n=== VERDICT ===\n');
 fprintf('Measured (steady) %.3f vs model %.3f. Agreement within %.1f pt.\n', ...
         measuredMotorInverterEff, mean(physicsRealWorld(steadyMotoringMask)), ...
         100*abs(mean(physicsRealWorld(steadyMotoringMask))-measuredMotorInverterEff));
-fprintf('Two independent methods, same answer -> the sim''s real-world\n');
-fprintf('efficiency layer stands. Caveat: only %d steady points; a deliberate\n', steadyCount);
-fprintf('steady-state run (or dyno pull) is what locks this permanently.\n');
+fprintf('NOT independent confirmation -- p.eta_inverter was calibrated to THIS number,\n');
+fprintf('and the "measured" torque is the inverter''s own model estimate, not a\n');
+fprintf('transducer. So this shows the calibration still HOLDS (which is how you catch\n');
+fprintf('drift), not that the model is externally validated. Only %d steady points.\n', steadyCount);
+fprintf('A dyno pull with a shaft torque transducer is what would actually settle it.\n');
