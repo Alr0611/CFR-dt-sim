@@ -11,15 +11,6 @@ drive that trades endurance efficiency against lap pace, and pricing hardware ch
 (halfshaft angle, diff, chain, bearings) in efficiency and battery Wh.
 
 > **New here / just want to run something?** See **[HOW_TO_USE.md](HOW_TO_USE.md)**,
-> a task-first cheat sheet ("I want to know X → run this → look here"). This page
-> is the full install + background.
-
-![Drivetrain efficiency by stage](docs/drivetrain_efficiency_by_stage.png)
-
-*Every stage on the same axis, weakest link at the bottom. Six stages multiply to a
-67.7% ceiling; the red carets are what the endurance lap actually delivered (62.0%).
-The gap between them is part-load operating cost, not broken hardware.*
-
 ---
 
 ## Inputs vs outputs
@@ -49,8 +40,6 @@ The gap between them is part-load operating cost, not broken hardware.*
 ---
 
 ## Install on Windows
-
-You need this once. Takes ~10 minutes.
 
 ### 1. Requirements
 
