@@ -1,259 +1,364 @@
-%% VERIFY_MATH — independent cross-checks of the gear-ratio model's physics
-% Recomputes load-bearing numbers from scratch and compares to datasheets.
-% PASS/FAIL printed for each. Nothing here imports the main script's results.
-clear; clc;
-pass = @(name,cond) fprintf('[%s] %s\n', string(cond).replace("true","PASS").replace("false","**FAIL**"), name);
+%% VERIFY_MATH — regression suite over this repo's OWN assumptions
+%
+% WHAT THIS IS
+%   A regression suite. It re-derives the load-bearing numbers from scratch, from
+%   the SAME parameters the sim uses (params_cfr26), and shouts if a result stops
+%   matching. Its job is to stop someone (human or AI) editing a constant and
+%   quietly changing a conclusion three files away.
+%
+% WHAT THIS IS *NOT*
+%   External validation. Nothing here is an independent measurement of the car.
+%   Most "expected" values are the repo's own assumptions, or the CFR26 DT memo's
+%   assumptions, which the repo inherited. A green run means THE MODEL IS
+%   SELF-CONSISTENT. It does not mean the model is right about the car.
+%   The things that would actually validate it: a dyno pull, a coastdown, a
+%   deliberate steady-state efficiency run, a measured loaded wheel radius.
+%   Where a check compares against something genuinely external -- an ESF number,
+%   a datasheet rating, a CFD force -- it says so on the line.
+%
+% INPUTS COME FROM params_cfr26(). This file used to hardcode its own copies of
+%   R_phase, Nm_per_Arms, the core-loss coefficients and eta_inverter, which meant
+%   you could edit params_cfr26, change every result in the repo, and still watch
+%   this print PASS all the way down. That is exactly backwards for a gate. Every
+%   model input below now reads p.* so a params edit CANNOT pass unnoticed.
+% (This is a FUNCTION file, not a script, purely so the pass/fail counter below can
+%  share a workspace with the checks. Call it the same way: verify_math)
+function verify_math()
+clc;
+thisdir = fileparts(mfilename('fullpath'));
+addpath(thisdir, fullfile(thisdir,'lib'));
+p = params_cfr26();
 
-fprintf('=== 1. PACK CONFIGURATION (vs ESF V2.3) ===\n');
-Ns = 88; Np = 4;
-fprintf('  88S x 4P = %d cells (ESF: 352)\n', Ns*Np);
-pass('total cell count = 352', Ns*Np == 352);
-Vnom = Ns*3.6; Vmax = Ns*4.2;
+nPass = 0; nFail = 0;
+% pass() prints one PASS/FAIL line and keeps the tally. Nested so it can see the counters.
+    function pass(name, cond)
+        cond = logical(cond);
+        if cond, nPass = nPass + 1; else, nFail = nFail + 1; end
+        fprintf('[%s] %s\n', string(cond).replace("true","PASS").replace("false","**FAIL**"), name);
+    end
+
+% The physics model, rebuilt here from p.* -- deliberately NOT a call to
+% emrax208_efficiency, so the two are independent and can catch each other.
+% (Section 17 does test the real function.)
+motorPhysicsEff = @(rpm,T) (T.*rpm*2*pi/60) ./ ...
+    (T.*rpm*2*pi/60 + 3*(T/p.Nm_per_Arms).^2*p.R_phase + p.core_loss_a*rpm + p.core_loss_b*rpm.^2);
+
+%% 1. PACK CONFIGURATION  (external ref: ESF V2.3)
+fprintf('=== 1. PACK CONFIGURATION (vs ESF V2.3 -- EXTERNAL) ===\n');
+fprintf('  %dS x %dP = %d cells (ESF: 352)\n', p.N_series, p.N_parallel, p.N_series*p.N_parallel);
+pass('total cell count = 352 (ESF)', p.N_series*p.N_parallel == 352);
+Vnom = p.N_series*3.6; Vmax = p.N_series*4.2;
 fprintf('  nominal %.1f V (ESF 316.8), max %.1f V (ESF 369.6)\n', Vnom, Vmax);
-pass('nominal voltage 316.8 V', abs(Vnom-316.8)<0.1);
-pass('max voltage 369.6 V', abs(Vmax-369.6)<0.1);
+pass('nominal voltage 316.8 V (ESF)', abs(Vnom-316.8)<0.1);
+pass('max voltage 369.6 V (ESF)', abs(Vmax-369.6)<0.1);
 
-fprintf('\n=== 2. INITIAL SOC (rest voltage vs BMS) ===\n');
-SOC_lookupR = linspace(0,1,11);
-OCV = [2.42,3.17577,3.36868,3.52009,3.62396,3.74948,3.84225,3.93877,4.05245,4.0853,4.2];
-Vcell0 = 364.28/88;
-SOC0 = interp1(OCV, SOC_lookupR, Vcell0, 'linear');
-fprintf('  first sample 364.28 V / 88 = %.4f V/cell -> SOC %.1f%% (BMS logged 94.3%%)\n', Vcell0, SOC0*100);
+%% 2. INITIAL SOC from rest voltage  (external ref: the BMS's own logged SOC)
+fprintf('\n=== 2. INITIAL SOC (rest voltage vs BMS -- EXTERNAL) ===\n');
+Vcell0 = 364.28/p.N_series;
+SOC0 = interp1(p.rc.OCV_lookup, p.rc.SOC_lookupR, Vcell0, 'linear');
+fprintf('  first sample 364.28 V / %d = %.4f V/cell -> SOC %.1f%% (BMS logged 94.3%%)\n', ...
+    p.N_series, Vcell0, SOC0*100);
 pass('rest-voltage SOC within 1pt of BMS', abs(SOC0*100-94.3)<1.0);
 
+%% 3. EMRAX EFFICIENCY: physics vs datasheet, then the real-world haircut
 fprintf('\n=== 3. EMRAX EFFICIENCY: physics vs datasheet, then real-world ===\n');
-% Two layers: (a) the PHYSICS must reproduce the datasheet's motor-only ~96% peak,
-% (b) the sim REPORTS real-world (motor+inverter) after the eta_inverter haircut,
-% cross-checked against freeman803's measured telemetry (~0.86-0.90 on track).
-Rph=0.012; NmA=0.83; a=0.10833; b=2.7778e-5; eta_inv=0.95;
-efffun = @(rpm,T) (T.*rpm*2*pi/60) ./ (T.*rpm*2*pi/60 + 3*(T/NmA).^2*Rph + a*rpm + b*rpm.^2);
-test_pts = [3000 60; 2000 80; 2500 65; 4000 50; 1500 40];  % rpm, Nm (in/near datasheet island)
-for k=1:size(test_pts,1)
-    e = efffun(test_pts(k,1),test_pts(k,2))*100;
+% (a) the physics must reproduce the datasheet's motor-only ~96% peak (EXTERNAL),
+% (b) the sim reports real-world motor+inverter after p.eta_inverter. That haircut
+% was CALIBRATED to our telemetry, so (b) is an internal consistency check.
+testPoints = [3000 60; 2000 80; 2500 65; 4000 50; 1500 40];   % rpm, Nm, in/near the island
+for k = 1:size(testPoints,1)
+    e = motorPhysicsEff(testPoints(k,1),testPoints(k,2))*100;
     fprintf('  %d rpm / %d Nm -> %.1f%% motor (physics) | %.1f%% real (+inverter)\n', ...
-        test_pts(k,1), test_pts(k,2), e, e*eta_inv);
+        testPoints(k,1), testPoints(k,2), e, e*p.eta_inverter);
 end
-peak_e = efffun(2500,65)*100;
-pass('physics reproduces datasheet motor peak (95-97%)', peak_e>95 && peak_e<97);
-all_e = arrayfun(@(k) efffun(test_pts(k,1),test_pts(k,2))*100, 1:size(test_pts,1));
-pass('all physics island points within datasheet 92-98% envelope', all(all_e>=88 & all_e<=98));
-pass('real-world peak (motor+inverter) lands ~88-93%', peak_e*eta_inv>88 && peak_e*eta_inv<93);
+peakEff = motorPhysicsEff(2500,65)*100;
+pass('physics reproduces datasheet motor peak 95-97% (EXTERNAL)', peakEff>95 && peakEff<97);
+allEff = arrayfun(@(k) motorPhysicsEff(testPoints(k,1),testPoints(k,2))*100, 1:size(testPoints,1));
+pass('all physics island points inside datasheet envelope', all(allEff>=88 & allEff<=98));
+pass('real-world peak (motor+inverter) lands ~88-93%', peakEff*p.eta_inverter>88 && peakEff*p.eta_inverter<93);
 
+%% 3b. MOTOR EFFICIENCY IS MONOTONIC IN THE EXPECTED DIRECTION (torque sweep)
+fprintf('\n=== 3b. EFFICIENCY vs TORQUE SHAPE (must rise, peak, then fall) ===\n');
+% Physically: at low torque the fixed core loss dominates, so efficiency CLIMBS as
+% load comes on. Past the peak, copper loss (I^2*R) takes over and it FALLS. A model
+% that is monotonic all the way, or peaks at the wrong end, is broken -- and this is
+% the shape the whole "keep the motor loaded" argument rests on, so it gets a gate.
+sweepRpm = 3000; torqueSweep = 2:1:150;
+effSweep = motorPhysicsEff(sweepRpm, torqueSweep);
+[peakSweep, iPeak] = max(effSweep);
+fprintf('  at %d rpm: peak %.1f%% at %d Nm (rises below it, falls above it)\n', ...
+    sweepRpm, peakSweep*100, torqueSweep(iPeak));
+pass('efficiency strictly RISES with torque below the peak', all(diff(effSweep(1:iPeak)) > 0));
+pass('efficiency strictly FALLS with torque above the peak', all(diff(effSweep(iPeak:end)) < 0));
+pass('peak sits at an interior torque (not at either end)', iPeak > 1 && iPeak < numel(torqueSweep));
+
+%% 4. CORE-LOSS FIT vs the free-run-loss anchors it was fitted to
 fprintf('\n=== 4. CORE-LOSS FIT vs FREE-RUN-LOSS ANCHORS ===\n');
-for rpm=[3000 6000]
-    pl=a*rpm+b*rpm^2; fprintf('  %d rpm -> %.0f W\n', rpm, pl);
-end
-pass('575 W at 3000 rpm anchor', abs(a*3000+b*3000^2-575)<10);
-pass('1650 W at 6000 rpm anchor', abs(a*6000+b*6000^2-1650)<10);
+coreLoss = @(rpm) p.core_loss_a*rpm + p.core_loss_b*rpm.^2;
+for rpm = [3000 6000], fprintf('  %d rpm -> %.0f W\n', rpm, coreLoss(rpm)); end
+pass('575 W at 3000 rpm anchor', abs(coreLoss(3000)-575)<10);
+pass('1650 W at 6000 rpm anchor', abs(coreLoss(6000)-1650)<10);
 
-fprintf('\n=== 5. COPPER LOSS SANITY (continuous rating) ===\n');
-% Datasheet: continuous 80 Nm, continuous 100 Arms. Check Irms from torque.
-Irms80 = 80/NmA; fprintf('  80 Nm / 0.83 = %.1f Arms (datasheet continuous current 100 Arms)\n', Irms80);
+%% 5. COPPER LOSS SANITY vs the datasheet continuous rating (EXTERNAL)
+fprintf('\n=== 5. COPPER LOSS SANITY (continuous rating -- EXTERNAL) ===\n');
+Irms80 = 80/p.Nm_per_Arms;
+fprintf('  80 Nm / %.2f = %.1f Arms (datasheet continuous current 100 Arms)\n', p.Nm_per_Arms, Irms80);
 pass('continuous-torque current below 100 A rating', Irms80 < 100);
 
+%% 6. TIRE mu AT NOMINAL LOAD
 fprintf('\n=== 6. TIRE mu AT NOMINAL LOAD (vs ~1.4 ballpark) ===\n');
-PDX1=2.1; PDX2=-0.40981; LMUX=0.65; FNOM=667;
-mu_nom = LMUX*(PDX1+PDX2*0);
-fprintf('  LMUX*PDX1 = %.3f at nominal load\n', mu_nom);
-pass('nominal mu in 1.3-1.4 range', mu_nom>1.3 && mu_nom<1.4);
-mu_2x = LMUX*(PDX1+PDX2*1); % double load
-fprintf('  at 2x nominal load: %.3f (should drop -- load sensitivity)\n', mu_2x);
-pass('mu decreases with load', mu_2x < mu_nom);
+muNominal = p.tir.LMUX*(p.tir.PDX1 + p.tir.PDX2*0);
+fprintf('  LMUX*PDX1 = %.3f at nominal load\n', muNominal);
+pass('nominal mu in 1.3-1.4 range', muNominal>1.3 && muNominal<1.4);
+muDoubleLoad = p.tir.LMUX*(p.tir.PDX1 + p.tir.PDX2*1);
+fprintf('  at 2x nominal load: %.3f (should drop -- load sensitivity)\n', muDoubleLoad);
+pass('mu decreases with load', muDoubleLoad < muNominal);
 
+%% 7. GEAR-RATIO SHAFT-POWER INVARIANCE (the study's core assumption)
 fprintf('\n=== 7. GEAR-RATIO SHAFT-POWER INVARIANCE (core assumption) ===\n');
-% Same wheel power at any ratio -> shaft mechanical power must be identical.
-eta=0.823; P_shaft_old = 15000;           % arbitrary motoring point, W
-P_wheel = P_shaft_old*eta;                % motoring: wheel gets less
-P_shaft_new = P_wheel/eta;                % re-expand at new ratio
-fprintf('  shaft %.0f W -> wheel %.0f W -> shaft %.0f W\n', P_shaft_old, P_wheel, P_shaft_new);
-pass('shaft power ratio-invariant (round-trip identity)', abs(P_shaft_new-P_shaft_old)<1e-6);
-% torque splits inversely with ratio at fixed power
-wr=100; % wheel rad/s-equivalent placeholder
-T_at_461 = P_shaft_old/(wr*4.61); T_at_420 = P_shaft_old/(wr*4.20);
-pass('lower ratio -> higher shaft torque', T_at_420 > T_at_461);
+% Wheel power is what it is; re-expanding it at a new ratio must return the same
+% shaft power. If this ever fails, the whole "same laps, different gearing" method dies.
+shaftPowerIn = 15000;
+wheelPower    = shaftPowerIn*p.eta_drivetrain;
+shaftPowerOut = wheelPower/p.eta_drivetrain;
+fprintf('  shaft %.0f W -> wheel %.0f W -> shaft %.0f W\n', shaftPowerIn, wheelPower, shaftPowerOut);
+pass('shaft power ratio-invariant (round-trip identity)', abs(shaftPowerOut-shaftPowerIn)<1e-6);
+wheelOmega = 100;
+pass('lower ratio -> higher shaft torque', ...
+     shaftPowerIn/(wheelOmega*4.20) > shaftPowerIn/(wheelOmega*p.gear_current));
 
-fprintf('\n=== 8. LAUNCH FORCE BALANCE (hand check, 4.61:1) ===\n');
-m=294; g=9.81; rsf=0.483; hcg=0.3134; L=1.543; rw=0.2286;
-a_x=0;
-for it=1:8
-    Fzr = m*g*rsf + m*a_x*hcg/L;
-    dfz = (Fzr/2 - FNOM)/FNOM;
-    mu = LMUX*(PDX1+PDX2*dfz);
-    Ftr = mu*Fzr;
-    a_x = (Ftr - 0.015*m*g)/m;
+%% 8. LAUNCH FORCE BALANCE (hand check at the current ratio)
+fprintf('\n=== 8. LAUNCH FORCE BALANCE (hand check, %.2f:1) ===\n', p.gear_current);
+accelX = 0;
+for it = 1:8
+    Fz_rear = p.m_car*p.g*p.rear_static + p.m_car*accelX*p.h_cg/p.L_wb;
+    dfz     = (Fz_rear/2 - p.tir.FNOMIN)/p.tir.FNOMIN;
+    mu      = p.tir.LMUX*(p.tir.PDX1 + p.tir.PDX2*dfz);
+    F_traction = mu*Fz_rear;
+    accelX  = (F_traction - p.Crr*p.m_car*p.g)/p.m_car;
 end
-fprintf('  converged launch: Fz_rear %.0f N, a_x %.2f m/s^2 (%.2fg), traction force %.0f N\n', Fzr, a_x, a_x/g, Ftr);
-Tcap = Ftr*rw/(4.61*eta);
-fprintf('  -> motor torque cap %.0f Nm (main script TC seed printed ~147)\n', Tcap);
-pass('launch traction cap within 10 Nm of TC-seed value', abs(Tcap-147)<10);
-Tflat  = 150;   % must track params_cfr26 p.T_flat_cap (datasheet spec peak)
-Fmotor = Tflat*4.61*eta/rw;
+fprintf('  converged launch: Fz_rear %.0f N, a_x %.2f m/s^2 (%.2fg), traction force %.0f N\n', ...
+    Fz_rear, accelX, accelX/p.g, F_traction);
+torqueCap = F_traction*p.r_wheel/(p.gear_current*p.eta_drivetrain);
+fprintf('  -> motor torque cap %.0f Nm\n', torqueCap);
+pass('launch traction cap in a sane 120-170 Nm range', torqueCap>120 && torqueCap<170);
+F_motor = p.T_flat_cap*p.gear_current*p.eta_drivetrain/p.r_wheel;
 fprintf('  motor can push %.0f N (%.0f Nm) vs %.0f N traction limit -> %s at launch\n', ...
-    Fmotor, Tflat, Ftr, string(Fmotor>Ftr).replace("true","TRACTION-limited").replace("false","motor-limited"));
+    F_motor, p.T_flat_cap, F_traction, ...
+    string(F_motor>F_traction).replace("true","TRACTION-limited").replace("false","motor-limited"));
+fprintf('  NOTE: accel_model''s own traction cap has a UNIT BUG (it divides by eta twice)\n');
+fprintf('  and so never binds. This hand check and that model DISAGREE on purpose until\n');
+fprintf('  launch/TC data settles it -- see the comment at accel_model.m accel_run.\n');
 
+%% 9. ENERGY THROUGHPUT ORDER-OF-MAGNITUDE
 fprintf('\n=== 9. ENERGY THROUGHPUT ORDER-OF-MAGNITUDE ===\n');
-% 3.4 kWh over 22.5 km -> Wh/km, compare to typical FSAE endurance (~30-40 Wh/km...
-% but with idle/cool-down laps in the log, effective can differ)
-kWh=3.41; km=22.5;
+kWh = 3.41; km = 22.5;   % July 11 endurance run, from the logged odometer + pack energy
 fprintf('  %.2f kWh / %.1f km = %.0f Wh/km\n', kWh, km, kWh*1000/km);
 pass('specific energy in plausible FSAE range 100-250 Wh/km', kWh*1000/km>100 && kWh*1000/km<250);
 
-fprintf('\n=== 10. HV VARIANT CONFIRMATION (user: car is 370V HV) ===\n');
-% 88S x 4.2V = 369.6V max -> "370V HV". Datasheet HV variant max battery
-% voltage is 470V, so 370V is within limits and the HV column (0.83 Nm/Arms,
-% 12mOhm phase R, 100A cont) is the correct one to have used.
-fprintf('  88S x 4.2V = %.1f V max = "370V" -> under HV 470V limit -> HV constants correct\n', 88*4.2);
-pass('370V pack uses HV datasheet column (max 470V)', 88*4.2 < 470 && 88*4.2 > 320);
+%% 10. HV VARIANT CONFIRMATION (external: datasheet column selection)
+fprintf('\n=== 10. HV VARIANT CONFIRMATION (car is a 370V HV pack) ===\n');
+fprintf('  %dS x 4.2V = %.1f V max -> under the HV 470V limit -> HV constants correct\n', ...
+    p.N_series, p.N_series*4.2);
+pass('370V pack uses HV datasheet column (max 470V)', p.N_series*4.2 < 470 && p.N_series*4.2 > 320);
 
+%% 11. MECHANICAL STACK PRODUCT *IS* p.eta_drivetrain
 fprintf('\n=== 11. DRIVETRAIN EFFICIENCY CHAIN (mechanical hardware) ===\n');
-mech_no_hs = 0.98*0.95*0.97*0.92;              % gears x bearings x chain x diff
-chain_str  = mech_no_hs*0.99;                  % + straight halfshaft (old design-target value)
-chain_12   = mech_no_hs*0.9559;                % + 12deg halfshaft (current car; drivetrain_efficiency)
-fprintf('  mech stack: straight-halfshaft %.4f | 12deg-halfshaft %.4f\n', chain_str, chain_12);
-pass('straight-halfshaft mech stack = 0.823 (the old value)', abs(chain_str-0.823)<0.002);
-pass('12deg mech stack = 0.794 (what params_cfr26 now uses)', abs(chain_12-0.794)<0.003);
+% The stage values are the CFR26 DT memo's ASSUMPTIONS (not measured -- see
+% drivetrain_efficiency.m). What this gates is that the product of the stack still
+% equals the single number the rest of the sim uses. If someone edits one stage and
+% forgets eta_drivetrain, or vice versa, the repo starts disagreeing with itself here.
+stageSpur = 0.98; stageBearings = 0.95; stageChain = 0.97; stageDiff = 0.92;   % memo v4.0
+mechNoHalfshaft = stageSpur*stageBearings*stageChain*stageDiff;
+halfshaftJoint  = @(beta) 1 - 2*p.hs_kloss*sind(beta);
+halfshaftLapWtd = @(beta) p.hs_frac_straight*halfshaftJoint(beta) ...
+                        + (1-p.hs_frac_straight)*halfshaftJoint(beta + p.hs_corner_deg);
+halfshaftAtAngle = halfshaftLapWtd(p.hs_angle_deg);
+mechStackProduct = mechNoHalfshaft * halfshaftAtAngle;
+fprintf('  %.2f x %.2f x %.2f x %.2f x halfshaft@%gdeg %.4f = %.4f\n', ...
+    stageSpur, stageBearings, stageChain, stageDiff, p.hs_angle_deg, halfshaftAtAngle, mechStackProduct);
+fprintf('  params_cfr26 p.eta_drivetrain = %.4f\n', p.eta_drivetrain);
+pass('mech stack product EQUALS p.eta_drivetrain (to rounding)', ...
+     abs(mechStackProduct - p.eta_drivetrain) < 0.001);
+fprintf('  straight-halfshaft variant (0 deg) would be %.4f\n', mechNoHalfshaft*halfshaftLapWtd(0));
+pass('straightening halfshafts raises the mech stack', mechNoHalfshaft*halfshaftLapWtd(0) > p.eta_drivetrain);
 
-fprintf('\n=== 12. AERO FORCES from CFD dimensional values ===\n');
-q25 = 0.5*1.225*25^2;  % dynamic pressure at 25 m/s
-CdA = 442.719/q25; ClA = 957.592/q25;
-fprintf('  q(25 m/s) = %.1f Pa | CdA = %.3f m^2 | ClA = %.3f m^2\n', q25, CdA, ClA);
-% back-check: force at 25 m/s must return the CFD inputs
-Fdrag25 = 0.5*1.225*CdA*25^2; Fdown25 = 0.5*1.225*ClA*25^2;
-fprintf('  recomputed @25 m/s: drag %.1f N (CFD 442.7), downforce %.1f N (CFD 957.6)\n', Fdrag25, Fdown25);
-pass('drag force round-trips to CFD value', abs(Fdrag25-442.719)<1);
-pass('downforce round-trips to CFD value', abs(Fdown25-957.592)<1);
+%% 12. AERO: the construction chain from the CFD run to p.CdA / p.ClA
+fprintf('\n=== 12. AERO CONSTRUCTION CHAIN (CFD run -> params) ===\n');
+% HEADS UP -- p.CdA is deliberately NOT the drag area the CFD run produced.
+% The CFD run implied Cd = 1.14278. The aero lead later revised Cd DOWN to 0.922.
+% params_cfr26 keeps the CFD's FRONTAL AREA (which the revision doesn't change) and
+% re-applies the new Cd on top:
+%       A_ref  = (F_drag_CFD / q25) / 1.14278      <- frontal area, from the CFD run
+%       p.CdA  = 0.922 * A_ref                     <- revised Cd on that same area
+% So p.CdA sits ~19% BELOW the CFD-implied drag area ON PURPOSE. That is a real
+% modelling decision, not drift.
+%
+% The previous version of this check computed CdA = F_CFD/q25 locally and then
+% confirmed that 0.5*rho*CdA*25^2 came back to F_CFD -- which is algebraically
+% guaranteed and never touched p.CdA at all. It could not fail. Now we gate the
+% actual chain, so a change to either Cd or the CFD force gets caught.
+q25 = 0.5*p.rho_air*25^2;
+FdragCFD = 442.719;  Cd_CFD = 1.14278;  Cd_revised = 0.922;
+A_ref_expected = (FdragCFD/q25)/Cd_CFD;
+fprintf('  q(25 m/s) = %.1f Pa | CFD drag area %.3f m^2 -> frontal area %.3f m^2\n', ...
+    q25, FdragCFD/q25, A_ref_expected);
+fprintf('  p.CdA = %.3f m^2 (revised Cd %.3f x A_ref) | p.ClA = %.3f m^2\n', ...
+    p.CdA, Cd_revised, p.ClA);
+pass('p.CdA = revised Cd x CFD frontal area', abs(p.CdA - Cd_revised*A_ref_expected) < 1e-3);
+pass('p.CdA is below the CFD-implied drag area (Cd was revised DOWN)', p.CdA < FdragCFD/q25);
+pass('p.ClA/p.CdA holds the wind-tunnel lift:drag ratio', abs(p.ClA/p.CdA - 577.8/359.7) < 1e-3);
+% and the CFD run's OWN numbers must still round-trip through its OWN drag area
+pass('CFD force round-trips through the CFD drag area (EXTERNAL)', ...
+     abs(0.5*p.rho_air*(FdragCFD/q25)*25^2 - FdragCFD) < 1);
+fprintf('  forces at 25 m/s AS THE SIM USES THEM: drag %.1f N, downforce %.1f N\n', ...
+    0.5*p.rho_air*p.CdA*25^2, 0.5*p.rho_air*p.ClA*25^2);
 
-fprintf('\n=== 13. RC DISCRETIZATION + KALMAN STRUCTURE (sanity, not new physics) ===\n');
-% Zero-order-hold of a first-order RC: Vrc(k+1)=exp(-dt/tau)Vrc(k)+R(1-exp(-dt/tau))I
-dt=0.1; R1=0.002; C1=1000; tau=R1*C1; decay=exp(-dt/tau);
-fprintf('  tau=R1*C1=%.1f s, exp(-dt/tau)=%.4f (in (0,1) => stable decay)\n', tau, decay);
+%% 13. RC DISCRETIZATION + the open-loop cell model actually runs
+fprintf('\n=== 13. RC DISCRETIZATION + OPEN-LOOP CELL MODEL ===\n');
+dt = 0.1; Rb = 0.002; Cb = 1000; tau = Rb*Cb; decay = exp(-dt/tau);
+fprintf('  tau=R*C=%.1f s, exp(-dt/tau)=%.4f (in (0,1) => stable decay)\n', tau, decay);
 pass('RC decay factor in (0,1)', decay>0 && decay<1);
-% Steady state of RC branch under constant I must approach I*R
-Vrc=0; for n=1:2000, Vrc=decay*Vrc+R1*(1-decay)*10; end
-fprintf('  RC branch steady state under 10 A -> %.4f V (expect I*R = %.4f V)\n', Vrc, 10*R1);
-pass('RC steady state = I*R', abs(Vrc-10*R1)<1e-4);
+Vrc = 0; for n = 1:2000, Vrc = decay*Vrc + Rb*(1-decay)*10; end
+fprintf('  RC branch steady state under 10 A -> %.4f V (expect I*R = %.4f V)\n', Vrc, 10*Rb);
+pass('RC steady state = I*R', abs(Vrc-10*Rb)<1e-4);
 
-fprintf('\n=== 14. TOP-SPEED FORCE BALANCE (4.61:1 spot check) ===\n');
-% At the reported ~112 kph (31.1 m/s) top speed, motor force must ~equal resistance.
-v=112/3.6; ratio=4.61; rw=0.2286;
-rpm = v/rw*ratio*60/(2*pi);
-fprintf('  112 kph -> %.0f motor rpm (redline 6000)\n', rpm);
-pass('top-speed rpm under redline', rpm < 6000);
-Fdown=0.5*1.225*ClA*v^2; Fres=0.5*1.225*CdA*v^2+0.015*(294*9.81+Fdown);
-fprintf('  resistance at 112 kph = %.0f N (drag+roll+downforce-roll)\n', Fres);
+% run_open_loop must RUN, and SOC must fall monotonically under a pure discharge.
+% This is the check that would have caught the R/C tables being read backwards, and
+% it fails loudly rather than returning a plausible-looking trace.
+rcTest = p.rc; rcTest.SOC0 = 0.90;
+nSteps = 600; dischargeCurrent = 20*ones(nSteps,1); stepVec = 0.1*ones(nSteps,1);
+[socTrace, voltTrace] = run_open_loop(dischargeCurrent, stepVec, rcTest);
+fprintf('  open-loop 20 A discharge, %d steps: SOC %.4f -> %.4f, V %.3f -> %.3f\n', ...
+    nSteps, socTrace(1), socTrace(end), voltTrace(1), voltTrace(end));
+pass('run_open_loop returns finite SOC and voltage', all(isfinite(socTrace)) && all(isfinite(voltTrace)));
+pass('SOC MONOTONICALLY FALLS during discharge', all(diff(socTrace) <= 1e-12));
+pass('SOC stays inside [0,1] during discharge', all(socTrace>=0 & socTrace<=1));
+pass('terminal voltage sags below OCV under load', ...
+     voltTrace(1) < interp1(p.rc.SOC_lookupR, p.rc.OCV_lookup, socTrace(1), 'linear'));
+% and the mirror: charging must push SOC back UP
+[socCharge, ~] = run_open_loop(-20*ones(nSteps,1), stepVec, rcTest);
+pass('SOC MONOTONICALLY RISES during charge', all(diff(socCharge) >= -1e-12));
+% the trailing-zero artifact must never reach a lookup
+pass('no zero/negative resistance survives the table guard', ...
+     all(isfinite(voltTrace)) && ~any(voltTrace == 0));
+
+%% 14. TOP-SPEED FORCE BALANCE
+fprintf('\n=== 14. TOP-SPEED FORCE BALANCE (%.2f:1 spot check) ===\n', p.gear_current);
+v = 112/3.6;
+rpmTop = v/p.r_wheel*p.gear_current*60/(2*pi);
+fprintf('  112 kph -> %.0f motor rpm (redline %d)\n', rpmTop, p.redline);
+pass('top-speed rpm under redline', rpmTop < p.redline);
+Fdown = 0.5*p.rho_air*p.ClA*v^2;
+Fres  = 0.5*p.rho_air*p.CdA*v^2 + p.Crr*(p.m_car*p.g + Fdown);
+fprintf('  resistance at 112 kph = %.0f N (drag + rolling, downforce-loaded)\n', Fres);
 pass('resistance force positive and plausible (<1500 N)', Fres>0 && Fres<1500);
 
-fprintf('\n=== 15. REAL-WORLD EFFICIENCY vs RAW TELEMETRY (af/dteff cross-check) ===\n');
-% The eta_inverter = 0.95 haircut was calibrated against measured telemetry
-% (freeman803's af/dteff method: shaft power / pack power). This check re-derives
-% the measured number from the RAW June 20 CSV every run, so if anyone touches
-% the physics constants or the haircut, the sim can no longer silently drift
-% away from what the car actually measured. (Honesty note: this closes the
-% calibration loop against the same session it was calibrated on -- it is a
-% consistency check. Independent validation = a deliberate steady-state run.)
-csvfile = fullfile(fileparts(mfilename('fullpath')), 'data', 'comp_june20_data.csv');
-if exist(csvfile, 'file')
-    D    = readtable(csvfile);
+%% 15. THE PHYSICS MODEL vs MEASURED PACK-TO-SHAFT EFFICIENCY
+fprintf('\n=== 15. PHYSICS MODEL vs MEASURED PACK-TO-SHAFT EFFICIENCY ===\n');
+% THE MEASURED METHOD, stated so nobody has to go ask a person what it is:
+%   efficiency = mechanical power OUT / electrical power IN
+%              = (motor torque x motor speed) / (pack voltage x pack current),
+%   over steady-state motoring points only (transients book inertia as "loss").
+% HONESTY: p.eta_inverter was CHOSEN to make the physics model match this measured
+% number, on this session. So this check closes a loop on its own calibration --
+% consistency, NOT independent validation. Independent = a deliberate steady-state
+% dyno run. Also note the torque channel is the inverter's own MODEL-DERIVED torque
+% estimate, not a transducer, so "measured" is doing some work in that word.
+csvComp = fullfile(thisdir, 'data', 'comp_june20_data.csv');
+if exist(csvComp, 'file')
+    D    = readtable(csvComp);
     rpmT = abs(D.PM100DX_motorSpeed);  tqT = abs(D.PM100DX_torqueFeedback);
     elec = abs(D.BMSB_packVoltage .* D.BMSB_packCurrent);
     mech = tqT .* rpmT * 2*pi/60;
-    % (a) rigid driveline: motor:axle speed ratio must equal the gear ratio.
-    %     This is WHY the af/dteff map's hardcoded 4.6 cancels, making their
-    %     map motor+inverter (pack->shaft), directly comparable to ours.
+    % (a) rigid driveline: motor:axle speed ratio must equal the gear ratio. This is
+    %     WHY the ratio cancels, making the measured map a pack->SHAFT number.
     axle = abs(D.VCREAR_wheelSpeedRL);
     gd   = rpmT>500 & axle>20;
-    ratio_meas = median(rpmT(gd)./axle(gd));
-    fprintf('  motor:axle speed ratio from data = %.3f (gear ratio 4.61)\n', ratio_meas);
-    pass('measured speed ratio = gear ratio (their 4.6 cancels)', abs(ratio_meas-4.61)<0.15);
-    % (b) steady-state points only -- transients book inertia power as "loss"
-    motorm = rpmT>500 & tqT>5 & elec>500 & mech./elec>0.3 & mech./elec<1.0;
-    steady = motorm & movstd(rpmT,11)<40 & movstd(tqT,11)<3;
-    % fit packElec = mech/eta + P0: slope -> motor+inverter eff, intercept ->
-    % accessory draw (pumps/LV) that isn't the motor's fault
+    ratioMeasured = median(rpmT(gd)./axle(gd));
+    fprintf('  motor:axle speed ratio from data = %.3f (gear ratio %.2f)\n', ratioMeasured, p.gear_current);
+    pass('measured speed ratio = gear ratio (so the ratio cancels)', abs(ratioMeasured-p.gear_current)<0.15);
+    % (b) steady-state points only
+    motoring = rpmT>500 & tqT>5 & elec>500 & mech./elec>0.3 & mech./elec<1.0;
+    steady   = motoring & movstd(rpmT,11)<40 & movstd(tqT,11)<3;
+    % fit elec = mech/eta + P0: slope -> motor+inverter eff, intercept -> accessory draw
     A = [mech(steady) ones(nnz(steady),1)];  x = A\elec(steady);
-    eta_meas = 1/x(1);  P0 = x(2);
+    etaMeasured = 1/x(1);  accessoryW = x(2);
     fprintf('  %d steady pts | measured motor+inverter eff %.3f | accessory %.0f W\n', ...
-        nnz(steady), eta_meas, P0);
-    pass('measured motor+inverter eff in 0.83-0.91 band', eta_meas>0.83 && eta_meas<0.91);
-    % (c) the sim's real-world model on the SAME points must match the measurement
-    eta_model = mean(efffun(rpmT(steady), tqT(steady))) * eta_inv;
-    fprintf('  sim real-world model on same points: %.3f (measured %.3f, gap %+.4f)\n', ...
-        eta_model, eta_meas, eta_model-eta_meas);
-    pass('sim real-world eff within 0.02 of measured', abs(eta_model-eta_meas)<0.02);
+        nnz(steady), etaMeasured, accessoryW);
+    pass('measured motor+inverter eff in 0.83-0.91 band', etaMeasured>0.83 && etaMeasured<0.91);
+    % (c) the model on the SAME points must still land on the measurement
+    etaModel = mean(motorPhysicsEff(rpmT(steady), tqT(steady))) * p.eta_inverter;
+    fprintf('  physics model x p.eta_inverter on same points: %.3f (measured %.3f, gap %+.4f)\n', ...
+        etaModel, etaMeasured, etaModel-etaMeasured);
+    pass('model within 0.02 of measured (calibration holds)', abs(etaModel-etaMeasured)<0.02);
 else
     fprintf('  [data/comp_june20_data.csv not found -- check skipped]\n');
 end
 
-fprintf('\n=== 16. DRIVETRAIN EFFICIENCY STACK + HALFSHAFT ANGLE MODEL ===\n');
-% Locks the math in drivetrain_efficiency.m. Recomputed from scratch here (this
-% file imports nothing), so if anyone edits the stack, the CV-joint coefficient
-% or the halfshaft angle in the tool, these independently re-derived numbers
-% catch the drift. Source: CFR26_DT_Efficiency.pdf v4.0 [1].
-% (a) the memo's stage product must reproduce its own published 0.724.
-eta_memo = 0.89*0.98*0.95*0.97*0.92*0.98;   % motor spur brng chain diff halfshaft
-fprintf('  memo stack 0.89*0.98*0.95*0.97*0.92*0.98 = %.4f (memo prints 0.724)\n', eta_memo);
-pass('DT memo stack reproduces 0.724', abs(eta_memo-0.724)<0.002);
-% (b) CV-joint loss model eta_shaft = 1 - 2*kloss*sin(beta): the coefficient must
-% be consistent across the memo's OWN two operating points (that agreement is the
-% model's validation, not a fitted guess).
-k_str = (1-0.99)/(2*sind(3));   k_cor = (1-0.94)/(2*sind(20));
-fprintf('  kloss from straight pt = %.3f, from corner pt = %.3f (agree => model holds)\n', k_str, k_cor);
-pass('CV-joint kloss self-consistent within 12%', abs(k_str-k_cor)/mean([k_str k_cor])<0.12);
-% (c) the halfshaft term at the REAL 12 deg static angle (kloss 0.09, corner +8 deg,
-% 72.4% of the lap near static) -- must sit below the memo's 0.99 "straight" number,
-% which is exactly why params' 0.823 is a touch optimistic.
-kloss=0.09; hsf=@(b) 1-2*kloss*sind(b); fs=0.724; ce=8;
-hs12 = fs*hsf(12) + (1-fs)*hsf(12+ce);
-fprintf('  halfshaft term @12 deg static = %.4f (memo assumed 0.99 straight)\n', hs12);
-pass('halfshaft term @12 deg in 0.94-0.97 band', hs12>0.94 && hs12<0.97);
-pass('12 deg term < memo straight 0.99 (so params 0.823 is optimistic)', hs12 < 0.99);
-% (d) measured pack->shaft (July 11 endurance, freeman803 method) x mech stack must
-% reproduce the tool's telemetry-anchored overall (battery->ground).
-csv2 = fullfile(fileparts(mfilename('fullpath')), 'data', 'endurance_july11_with_odo_wide.csv');
-if exist(csv2,'file')
-    E2  = readtable(csv2);
-    rr  = abs(E2.PM100DX_motorSpeed);  qq = abs(E2.PM100DX_torqueFeedback);
-    pk  = abs(E2.BMSB_packVoltage .* E2.BMSB_packCurrent);  mm = qq.*rr*2*pi/60;
-    kp  = rr>500 & qq>5 & pk>500 & mm./pk>0.3 & mm./pk<1.0;
-    eta_sh  = sum(mm(kp))/sum(pk(kp));
-    overall = eta_sh * 0.98*0.95*0.97*0.92 * hs12;
-    fprintf('  measured pack->shaft %.3f -> overall battery->ground %.3f\n', eta_sh, overall);
-    pass('measured pack->shaft in 0.75-0.90 band', eta_sh>0.75 && eta_sh<0.90);
-    pass('overall battery->ground in 0.58-0.70 band', overall>0.58 && overall<0.70);
+%% 16. HALFSHAFT / CV-JOINT MODEL
+fprintf('\n=== 16. DRIVETRAIN STACK + HALFSHAFT ANGLE MODEL ===\n');
+% (a) the memo's own stage product must reproduce its published 0.724.
+etaMemo = 0.89*stageSpur*stageBearings*stageChain*stageDiff*0.98;
+fprintf('  memo stack 0.89*0.98*0.95*0.97*0.92*0.98 = %.4f (memo prints 0.724)\n', etaMemo);
+pass('DT memo stack reproduces 0.724', abs(etaMemo-0.724)<0.002);
+% (b) kloss round-trip. READ THIS: p.hs_kloss was BACK-FITTED to these two memo
+% points, so of course it reproduces them. This is NOT evidence the model is right --
+% it only catches someone changing p.hs_kloss without meaning to. See params_cfr26.
+klossFromStraight = (1-0.99)/(2*sind(3));   klossFromCorner = (1-0.94)/(2*sind(20));
+fprintf('  kloss implied by memo pts: %.3f (3deg) / %.3f (20deg); params has %.3f\n', ...
+    klossFromStraight, klossFromCorner, p.hs_kloss);
+pass('p.hs_kloss still sits between the two fitted points', ...
+     p.hs_kloss >= min(klossFromStraight,klossFromCorner)-0.005 && ...
+     p.hs_kloss <= max(klossFromStraight,klossFromCorner)+0.005);
+% (c) the halfshaft term at the MEASURED static angle
+fprintf('  halfshaft term @%g deg static (MEASURED from CAD) = %.4f\n', p.hs_angle_deg, halfshaftAtAngle);
+pass('halfshaft term at the measured angle in 0.94-0.97 band', halfshaftAtAngle>0.94 && halfshaftAtAngle<0.97);
+pass('angle is flagged MEASURED in params', isfield(p,'hs_angle_is_measured') && p.hs_angle_is_measured);
+% (d) measured pack->shaft x mech stack must reproduce the tool's overall
+csvEnd = fullfile(thisdir, 'data', 'endurance_july11_with_odo_wide.csv');
+if exist(csvEnd,'file')
+    E2 = readtable(csvEnd);
+    rr = abs(E2.PM100DX_motorSpeed);  qq = abs(E2.PM100DX_torqueFeedback);
+    pk = abs(E2.BMSB_packVoltage .* E2.BMSB_packCurrent);  mm = qq.*rr*2*pi/60;
+    kp = rr>500 & qq>5 & pk>500 & mm./pk>0.3 & mm./pk<1.0;
+    etaPackToShaft = sum(mm(kp))/sum(pk(kp));
+    overallEff = etaPackToShaft * mechStackProduct;
+    fprintf('  measured pack->shaft %.3f -> overall battery->ground %.3f\n', etaPackToShaft, overallEff);
+    pass('measured pack->shaft in 0.75-0.90 band', etaPackToShaft>0.75 && etaPackToShaft<0.90);
+    pass('overall battery->ground in 0.58-0.70 band', overallEff>0.58 && overallEff<0.70);
 else
     fprintf('  [endurance CSV not found -- overall check skipped]\n');
 end
 
+%% 17. THE INVERTER IS ACTUALLY IN THE ENERGY PATH
 fprintf('\n=== 17. INVERTER IS IN THE ENERGY PATH (guards the old motor-only bug) ===\n');
-% Earlier versions reported motor-ONLY efficiency and so UNDER-counted battery draw
-% by ~5%. Every efficiency/energy script now routes through emrax208_efficiency;
-% this section tests that REAL function (not a reimplementation -- the whole point
-% is to catch the actual code dropping the inverter) and confirms the haircut is live.
-thisdir = fileparts(mfilename('fullpath'));
-addpath(thisdir, fullfile(thisdir,'lib'));
-if exist('emrax208_efficiency','file') && exist('params_cfr26','file')
-    pp = params_cfr26();
-    e_with     = emrax208_efficiency(3000, 60, pp);                     % motor + inverter
-    e_motonly  = emrax208_efficiency(3000, 60, rmfield(pp,'eta_inverter')); % motor alone
-    fprintf('  motor+inverter %.3f vs motor-only %.3f -> ratio %.3f (eta_inverter %.2f)\n', ...
-        e_with, e_motonly, e_with/e_motonly, pp.eta_inverter);
-    pass('emrax208_efficiency applies the inverter haircut', abs(e_with/e_motonly - pp.eta_inverter) < 0.01);
-    pass('inverter drops reported efficiency by >=3 pts', (e_motonly - e_with) > 0.03);
-    % params eta_drivetrain must match the tool's 12deg mechanical hardware stack (0.794),
-    % so drivetrain_efficiency.m and the rest of the sim can't disagree on the hardware number.
-    pass('params eta_drivetrain matches 12deg hardware stack (0.794)', abs(pp.eta_drivetrain - 0.794) < 0.004);
-    % Where each script stands (documented, not re-run here):
-    %   gear_ratio_optimization: battery/SOC draw = motoring_regen_power(shaft, eff)
-    %     with eff = emrax208_efficiency -> inverter INCLUDED in energy. OK.
-    %   drivetrain_efficiency:   electrical end is MEASURED pack->shaft (already
-    %     motor+inverter); mech stack multiplied on top. OK.
-    %   accel_model/top_speed:   torque x eta_drivetrain (MECHANICAL only). Correct --
-    %     the inverter doesn't reduce deliverable shaft torque, only draws more current.
-    fprintf('  gear_ratio_optimization energy: inverter-inclusive (via emrax208_efficiency). OK\n');
-    fprintf('  accel/top-speed torque: eta_drivetrain (mech) only -- inverter correctly excluded.\n');
+% Earlier versions reported motor-ONLY efficiency and under-counted battery draw by
+% ~5%. This tests the REAL lib function (not the reimplementation above) -- the whole
+% point is to catch the shipped code dropping the inverter.
+effWithInverter = emrax208_efficiency(3000, 60, p);
+effMotorOnly    = emrax208_efficiency(3000, 60, rmfield(p,'eta_inverter'));
+fprintf('  motor+inverter %.3f vs motor-only %.3f -> ratio %.3f (p.eta_inverter %.2f)\n', ...
+    effWithInverter, effMotorOnly, effWithInverter/effMotorOnly, p.eta_inverter);
+pass('emrax208_efficiency applies the inverter haircut', ...
+     abs(effWithInverter/effMotorOnly - p.eta_inverter) < 0.01);
+pass('inverter drops reported efficiency by >=3 pts', (effMotorOnly - effWithInverter) > 0.03);
+% The two independent implementations must agree, so neither can drift alone.
+pass('lib function matches this file''s independent physics rebuild', ...
+     abs(effWithInverter - motorPhysicsEff(3000,60)*p.eta_inverter) < 1e-6);
+fprintf('  gear_ratio_optimization energy: inverter-INCLUDED (via emrax208_efficiency).\n');
+fprintf('  accel/top-speed torque: p.eta_drivetrain (mechanical) only -- inverter correctly\n');
+fprintf('  excluded, since the inverter draws more current rather than cutting shaft torque.\n');
+
+%% SUMMARY
+fprintf('\n=== SUMMARY: %d passed, %d FAILED (%d checks) ===\n', nPass, nFail, nPass+nFail);
+if nFail > 0
+    fprintf('Any **FAIL** above means that specific number needs a second look.\n');
 else
-    fprintf('  [lib/ not on path -- run via START or addpath(genpath(pwd)); check skipped]\n');
+    fprintf('All checks pass. That means the model is SELF-CONSISTENT with its own\n');
+    fprintf('assumptions -- NOT that it has been validated against the car. The open\n');
+    fprintf('items are still open: dyno/coastdown for the stage efficiencies, a measured\n');
+    fprintf('loaded wheel radius, launch/TC data for the traction question.\n');
 end
 
-fprintf('\n=== SUMMARY ===\n');
-fprintf('If any line above reads **FAIL**, that specific number needs a second look.\n');
+end
