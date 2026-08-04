@@ -31,6 +31,10 @@ addpath(fullfile(fileparts(mfilename('fullpath')), 'lib'));  % works wherever MA
 p = params_cfr26();
 
 %% ---- LOAD DATA ----
+% Pull both telemetry runs in and put every channel into the units the rest of the
+% file expects: per-CELL voltage and current, motor rpm/torque, mean wheel speed.
+% Two runs on purpose -- see the header for why efficiency and SOC come from different
+% sessions. The sign checks below fix logs that record motoring torque negative.
 enduranceData        = readtable('data/endurance_july11_with_odo_wide.csv');   % July 11 (SOC + validation)
 time                 = enduranceData.t_s;
 cellVoltage          = enduranceData.BMSB_packVoltage / p.N_series;            % per-cell V
@@ -67,6 +71,10 @@ fprintf('Comp (efficiency source): %d samples, %.1f min | RMSE(wheel*%.2f vs mot
 %   approximate driver intent from torqueFeedback -- that is achieved torque, not demand.
 
 %% ---- BATTERY MODEL VALIDATION (July 11) ----
+% Before trusting the battery model to answer 'what if we regeared', check it can
+% reproduce the pack voltage we actually recorded. Two ways: open-loop (coulomb count
+% + 2-RC, no feedback) and a Kalman filter that corrects SOC off measured voltage.
+% Starting SOC comes from the resting voltage of the first sample, not the BMS.
 rc = p.rc;
 rc.SOC0 = interp1(p.rc.OCV_lookup, p.rc.SOC_lookupR, cellVoltage(1), 'linear', 'extrap');
 bmsSOC  = enduranceData.BMSB_packSOC;
@@ -86,18 +94,25 @@ print_err('Open-loop RC', voltageOpenLoop - cellVoltage);
 %   tao1,2 RC time constants (R*C)        V_R1,V_R2 the two RC-branch voltages
 %   VOCV   open-circuit voltage(SOC)      dOCV  dOCV/dSOC (the H Jacobian term)
 %   H      measurement Jacobian           K1   Kalman gain      Ut  predicted terminal V
+%
+% TABLE INDEXING: the HPPC R/C tables are indexed by SOC (index 1 = empty), same as
+% OCV -- see params_cfr26. This block used to read them at 1-SOC while reading OCV at
+% SOC off the same grid. Fixed; see run_open_loop for the voltage-trace check that
+% settled it. Coulomb-counted SOC never touches these tables, so no SOC number moved.
 Q_noise = [7e-8 0 0; 0 6e-5 0; 0 0 6e-5]; R_noise = 0.2;
 Pcov = [1e-4 0 0; 0 1e-4 0; 0 0 1e-4];
 dOCV = gradient(p.rc.OCV_lookup, p.rc.SOC_lookupR);
 X = [rc.SOC0; 0; 0]; voltageKalman = zeros(numSamples,1); socKalman = zeros(numSamples,1);
 for k = 1:numSamples
     dt = timeStep(k); SOC = X(1);
+    % Charging and discharging get different tables -- cells aren't symmetric.
     if cellCurrent(k) < 0, sfx='_c'; else, sfx='_d'; end
-    Ri = interp1(p.rc.SOC_lookupR, p.rc.(['Ri' sfx]), 1-SOC, 'linear', 'extrap');
-    R1 = interp1(p.rc.SOC_lookupR, p.rc.(['R1' sfx]), 1-SOC, 'linear', 'extrap');
-    R2 = interp1(p.rc.SOC_lookupR, p.rc.(['R2' sfx]), 1-SOC, 'linear', 'extrap');
-    C1 = interp1(p.rc.SOC_lookupR, p.rc.(['C1' sfx]), 1-SOC, 'linear', 'extrap');
-    C2 = interp1(p.rc.SOC_lookupR, p.rc.(['C2' sfx]), 1-SOC, 'linear', 'extrap');
+    % lookupRC clamps off the trailing-zero grid point (HPPC artifact, see params).
+    Ri = lookupRC(p.rc, ['Ri' sfx], SOC);
+    R1 = lookupRC(p.rc, ['R1' sfx], SOC);
+    R2 = lookupRC(p.rc, ['R2' sfx], SOC);
+    C1 = lookupRC(p.rc, ['C1' sfx], SOC);
+    C2 = lookupRC(p.rc, ['C2' sfx], SOC);
     tao1 = R1*C1; tao2 = R2*C2;
     V_R1 = exp(-dt/tao1)*X(2) + R1*(1-exp(-dt/tao1))*cellCurrent(k);
     V_R2 = exp(-dt/tao2)*X(3) + R2*(1-exp(-dt/tao2))*cellCurrent(k);
@@ -119,6 +134,10 @@ coulombDeltaSOC = (rc.SOC0 - socOpenLoop(end))*100; bmsDeltaSOC = bmsSOC(1) - bm
 fprintf('Energy throughput: coulomb dSOC=%.1f pts vs BMS dSOC=%.1f pts\n', coulombDeltaSOC, bmsDeltaSOC);
 
 %% ---- GEAR RATIO SWEEP ----
+% The core trick: wheel speed is what it is -- the car went as fast as it went. So for
+% each candidate ratio we re-derive what the MOTOR would have been doing on those same
+% laps (rpm scales up, torque scales down, shaft power is unchanged), then re-run the
+% efficiency and battery draw at that new operating point.
 % Efficiency from comp (scale measured motor op-point by ratio change; clean).
 % SOC from July 11 (rescale measured current by the electrical-power delta).
 shaftPower_baseline      = motorTorque_endurance .* motorSpeed_endurance * (2*pi/60);   % July 11 shaft power
@@ -188,6 +207,7 @@ for i = 1:numGears
 end
 
 %% ---- COMPARISON TABLE ----
+% Print every ratio side by side, with deltas measured against the ratio on the car.
 % Reference for the delta columns: the current car (p.gear_current) when it's in the
 % tested set, otherwise the NEAREST tested ratio -- clearly labelled as a stand-in.
 % (find() returned empty for a single/custom ratio set that omits 4.61, which then
@@ -233,6 +253,15 @@ fprintf('   this study does not duplicate a weaker point-mass accel calc.\n');
 fprintf(' Eff/AvgEff = motor+inverter (physics model x eta_inverter) at each ratio''s operating\n');
 fprintf('   points -- for RANKING ratios; a mild optimistic bound. MEASURED as-driven over\n');
 fprintf('   endurance is ~78%%. Full battery->ground stack + per-stage: drivetrain_efficiency.m\n');
+fprintf(' NOTE -- this efficiency is NOT the same source as drivetrain_efficiency.m''s. That\n');
+fprintf('   file uses MEASURED telemetry (~0.86 pack->shaft); this uses the physics model x\n');
+fprintf('   p.eta_inverter (~0.90). They are not independent: eta_inverter=0.95 was CHOSEN to\n');
+fprintf('   reconcile the two, so their agreement is a calibration, not a validation.\n');
+fprintf(' KNOWN BIAS -- CONSTANT Kt: emrax208_efficiency assumes torque per amp never droops.\n');
+fprintf('   Real EMRAX Kt sags with saturation at high torque, so true copper loss (I^2*R) is\n');
+fprintf('   HIGHER than modelled, and most so at high torque. LOWER ratios demand MORE motor\n');
+fprintf('   torque -- so this model is most optimistic exactly where the low-ratio\n');
+fprintf('   recommendation sits. Read low-ratio gains as an UPPER BOUND, not a promise.\n');
 fprintf('=======================================================================================\n');
 
 %% ================= FIGURES (tabbed dashboard + separate op-points window) =================
@@ -240,12 +269,26 @@ lib_figs(resultsByRatio, operatingPoints, gearRatios, socCurves, time, cellVolta
     socOpenLoop, socKalman, bmsSOC, p);
 
 %% ---- EXPORT ----
+% Results to CSV so they can go straight into a slide without re-running MATLAB.
 writetable(struct2table(resultsByRatio), 'output/gear_ratio_results.csv');
 fprintf('\nSaved: output/gear_ratio_results.csv + 2 figure windows (dashboard + operating-points map)\n');
 fprintf('DATA: tire mu DERIVED (not measured); aero from Ford wind tunnel + aero lead;\n');
 fprintf('chassis from tilt test; battery from HPPC. Remaining estimates: Crr, wheel k-factor.\n');
 
 %% ---- LOCAL HELPERS ----
+function y = lookupRC(rc, fieldName, soc)
+%LOOKUPRC  Read an HPPC R/C table at a given SOC, without falling into the artifact.
+%   Every R and C table ends in a hard 0 at SOC=1 -- the HPPC fit ran out of data at
+%   the top of the grid. That is not a real zero resistance/capacitance, so we drop
+%   the last grid point and clamp rather than interpolate toward it. The data in
+%   params_cfr26 is left exactly as the test produced it.
+    nValid  = numel(rc.SOC_lookupR) - 1;
+    socGrid = rc.SOC_lookupR(1:nValid);
+    tbl     = rc.(fieldName);
+    y = interp1(socGrid, tbl(1:nValid), ...
+                min(max(soc, socGrid(1)), socGrid(end)), 'linear');
+end
+
 function print_err(name, err)
     absErr = abs(err);
     fprintf('%s: RMSE=%.4f V | Mean=%.4f | P95=%.4f | Max=%.4f V\n', ...

@@ -110,8 +110,11 @@ p.eta_inverter = 0.95;      % REAL-WORLD haircut. The datasheet 96% is the motor
                             % also runs power through the INVERTER (a whole second
                             % box the spec ignores), plus loses a bit more to
                             % switching harmonics, windage and heat that the clean
-                            % physics skips. Measured from the car (freeman803's
-                            % telemetry): real motor+inverter eff was ~0.86 vs our
+                            % physics skips. Measured from the car's own telemetry
+                            % (measured pack-to-shaft efficiency: mechanical power out
+                            % = motor torque x speed, divided by electrical power in
+                            % = pack voltage x pack current, energy-weighted over the
+                            % motoring points): real motor+inverter eff was ~0.86 vs our
                             % idealized ~0.91 -> everything we miss is ~5%. So this
                             % turns "motor spec efficiency" into "what actually
                             % reaches the shaft." PROVISIONAL: one run, ~175 steady
@@ -123,11 +126,23 @@ p.eta_inverter = 0.95;      % REAL-WORLD haircut. The datasheet 96% is the motor
 %  These lived inside drivetrain_efficiency.m; they are here now because
 %  accel_model.m needs the same model to answer "what would straightening the
 %  halfshafts buy us?", and two copies of a constant is how they drift apart.
-p.hs_kloss        = 0.090;  % friction-geometry coefficient. Cross-checked against the
-                            % CFR26 DT memo v4.0's own two points (0.99@3deg, 0.94@20deg
-                            % -> 0.096 and 0.088, agreeing to ~9%). (DERIVED)
+p.hs_kloss        = 0.090;  % friction-geometry coefficient. (DERIVED -- and read this
+                            % before you quote it.) This is BACK-FITTED to the CFR26 DT
+                            % memo v4.0's own two ASSUMED points (0.99@3deg, 0.94@20deg).
+                            % Check: 1-2*0.09*sin(3deg)=0.9906, 1-2*0.09*sin(20deg)=0.9384.
+                            % That is a ROUND-TRIP, not a cross-check -- we fit the memo's
+                            % assumptions and then "confirm" we reproduce them. There is NO
+                            % independent source for this number. Published CV-joint loss
+                            % figures are generally LOWER than this, so this model is
+                            % probably PESSIMISTIC about the current 12deg halfshafts --
+                            % which biases the repackaging case in its own favour. Worth
+                            % saying out loud when we present it.
+                            % What would actually settle it: a back-to-back dyno pull or a
+                            % coastdown at two different halfshaft angles.
+p.hs_angle_is_measured = true;   % the angle below is off CAD, not a placeholder
 p.hs_angle_deg    = 12;     % static halfshaft angle, diff-to-wheel, at ride height
-                            % driving STRAIGHT. *** PLACEHOLDER -- MEASURE FROM CAD ***
+                            % driving STRAIGHT. MEASURED from the suspension CAD at static
+                            % ride height, driving straight.
                             % Note this IS the straight-line angle: the joints work at
                             % 12 deg even with the steering dead ahead. 0 deg is not a
                             % driving condition, it is a repackaging target.
@@ -164,7 +179,17 @@ p.eff_sweet = 0.90;         % We call >=90% REAL (motor+inverter) efficiency the
 %  This is the cell's electrical personality: how its voltage sags under load
 %  and bounces back. Two RC pairs = fast sag + slow sag. Separate tables for
 %  charging vs discharging because cells aren't symmetric.
-%  These 11 numbers each = SOC from 0% to 100% in 10% steps.
+%  These 11 numbers each = SOC from 0% to 100% in 10% steps. SOC, not DOD:
+%  index 1 = empty, index 11 = full. OCV_lookup proves it (2.42 V empty ->
+%  4.2 V full) and every table below shares this one grid.
+%
+%  *** KNOWN DATA ARTIFACT -- the last entry of every R and C table is a hard 0. ***
+%  A cell does not have zero resistance or zero capacitance at 100% SOC; the HPPC
+%  fit just ran out of data at the top of the grid and left a 0 behind. The DATA IS
+%  LEFT AS-IS on purpose (this file is the record of what the test produced), but
+%  every lookup GUARDS against it: run_open_loop and the Kalman filter drop the last
+%  grid point and clamp instead of interpolating into the zero. If you add a real
+%  100%-SOC number from a re-run, delete the guard along with the 0.
 p.rc.SOC_lookupR = linspace(0,1,11);
 p.rc.OCV_lookup  = [2.42,3.17577,3.36868,3.52009,3.62396,3.74948,3.84225,3.93877,4.05245,4.0853,4.2];  % resting voltage vs charge
 p.rc.Ri_d = [0.0079,0.0066,0.0065,0.0056,0.0054,0.0062,0.0062,0.0063,0.0062,0.0064,0];   % instant resistance, discharging

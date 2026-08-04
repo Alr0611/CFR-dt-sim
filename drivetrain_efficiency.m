@@ -8,12 +8,32 @@
 %
 % How it's grounded
 %   The electrical end (pack -> motor shaft = motor + inverter) is MEASURED from
-%   real telemetry (af/dteff method): eff = mech power / pack power, energy-
-%   weighted over the run. The gear ratio cancels in that map, so it is pack ->
-%   SHAFT only. This file multiplies the MECHANICAL stack (CFR26 DT memo v4.0 [1])
-%   on top:
+%   real telemetry by the MEASURED PACK-TO-SHAFT method:
+%       eff = mechanical power out / electrical power in
+%           = (motor torque x motor speed) / (pack voltage x pack current)
+%   energy-weighted over the motoring points of the run. The gear ratio cancels in
+%   that map, so it is pack -> SHAFT only. This file multiplies the MECHANICAL stack
+%   (CFR26 DT memo v4.0 [1]) on top:
 %       eff_overall = motorInverterEfficiency(MEASURED) x spur x bearings x chain
 %                     x diff x halfshaft(angle)
+%
+% TWO EFFICIENCY SOURCES IN THIS REPO -- know which one you are quoting
+%   This file uses the MEASURED number (~0.86 pack->shaft, from telemetry).
+%   gear_ratio_optimization.m uses a DIFFERENT one: the physics model
+%   emrax208_efficiency x p.eta_inverter (~0.90). They are not independent --
+%   p.eta_inverter = 0.95 was CHOSEN to reconcile the physics model with this
+%   measured number. So "the physics agrees with the measurement" is partly
+%   circular by construction; it is a calibration, not a validation.
+%   Use MEASURED for absolute battery->ground claims (this file). Use the physics
+%   model for RANKING gear ratios (that file), where a uniform factor cancels.
+%
+% AND: "MEASURED" is not as clean as it sounds. The torque channel is
+%   PM100DX_torqueFeedback, which is the INVERTER'S OWN ESTIMATE of torque -- it
+%   comes from measured current run through the inverter's internal motor model.
+%   It is not a torque transducer. So the mechanical side of every "measured"
+%   efficiency here is partly MODEL-DERIVED, and it shares assumptions (notably Kt)
+%   with the physics model we compare it to. A shaft torque transducer on a dyno is
+%   what would make this an actual measurement.
 %
 % Results
 %   - printed: the battery->ground breakdown + every design lever priced two ways
@@ -47,16 +67,20 @@ baselineStages.differential = 0.92; % Drexler FS clutch-type LSD, CFR26 DT memo 
                             %   bearings we already count separately. NOT ADOPTED: it was a
                             %   derivation, not a measurement, and no published Drexler efficiency
                             %   figure exists. Settle it with a coastdown, not an argument.)
-baselineStages.halfshaftAngleDeg = p.hs_angle_deg;   % <-- *** MEASURE FROM CAD *** PLACEHOLDER.
-                            %   Halfshaft angle diff->wheel at static ride height,
-                            %   driving straight. The joints work at this angle every
-                            %   second of the lap. 12 deg is a PLACEHOLDER guess -- read
-                            %   the real value off the suspension CAD at ride height and
-                            %   put it here. The angle sweep below shows the sensitivity.
+baselineStages.halfshaftAngleDeg = p.hs_angle_deg;   % MEASURED from the suspension CAD at
+                            %   static ride height, driving straight. Not a placeholder --
+                            %   this is the real geometry. The joints work at this angle
+                            %   every second of the lap. The sweep below is kept for
+                            %   transparency: it shows how the gain depends on the angle,
+                            %   not because the angle is in doubt.
 
-% Halfshaft CV-joint loss model: eff = 1 - 2*kloss*sin(beta), two joints per shaft,
-% kloss ~0.09 cross-checked against the memo's own straight & corner points
-% (0.99@3deg, 0.94@20deg -> kloss 0.096 & 0.088, agree to ~9%).
+% Halfshaft CV-joint loss model: eff = 1 - 2*kloss*sin(beta), two joints per shaft.
+% kloss = 0.090 is BACK-FITTED to the memo's own two ASSUMED points (0.99@3deg,
+% 0.94@20deg) -- it reproduces them because it was fitted to them, which is a
+% round-trip, not a cross-check. No independent source. Published CV-joint loss
+% figures are generally lower, so this is probably PESSIMISTIC about the current
+% 12 deg shafts, i.e. it flatters the repackaging case. Settle it with a
+% back-to-back dyno pull or a coastdown at two angles. Full note in params_cfr26.
 % These now live in params_cfr26 (single source of truth) so accel_model can use the
 % same CV-joint model; values unchanged.
 KLOSS       = p.hs_kloss;          % friction-geometry coefficient
@@ -109,7 +133,8 @@ fprintf('   = %.1f%% mechanical hardware efficiency   (params_cfr26 eta_drivetra
     toPercent(hardwareEfficiency), toPercent(p.eta_drivetrain));
 fprintf('   NOTE: stage values are memo ASSUMPTIONS (dyno-measurable), diff %.2f included.\n', ...
     baselineStages.differential);
-fprintf('   Halfshaft angle is a CAD-MEASURE placeholder.\n\n');
+fprintf('   Halfshaft angle %d deg is MEASURED from suspension CAD (static, straight).\n\n', ...
+    baselineStages.halfshaftAngleDeg);
 
 fprintf(' MOTOR + INVERTER -- THREE numbers, each measuring a different thing:\n');
 fprintf('   ~90%%   physics model x eta_inverter at operating points -- gear_ratio_optimization\n');
@@ -214,10 +239,14 @@ printPackageRow('Hardware + straighten halfshafts to 0 deg',      overallHardwar
 fprintf(' (motor+inverter left out -- that''s operational, via the gear ratio.)\n\n');
 
 fprintf('=== HALFSHAFT ANGLE SWEEP (the one continuous knob, pure geometry) ===\n');
+fprintf(' The angle is CONFIRMED %d deg (MEASURED off suspension CAD). This sweep is here\n', ...
+    baselineStages.halfshaftAngleDeg);
+fprintf(' for transparency -- so you can see how much of the gain rides on the angle --\n');
+fprintf(' NOT because the angle is provisional.\n');
 fprintf(' angle | halfshaft | overall eff | battery saved\n');
 for angleDeg = [0 2 4 5 6 8 10 12]
     overallAtAngle = overall(setf(baselineStages,'halfshaftAngleDeg',angleDeg));
-    tag = ''; if angleDeg==baselineStages.halfshaftAngleDeg, tag = '  <- current (CAD-measure)'; end
+    tag = ''; if angleDeg==baselineStages.halfshaftAngleDeg, tag = '  <- current (MEASURED)'; end
     fprintf('  %3.0f  |  %5.1f%%   |   %5.1f%%    |  %s%s\n', ...
         angleDeg, toPercent(halfshaftEfficiency(angleDeg)), toPercent(overallAtAngle), ...
         battxt(1-overallEfficiencyCurrent/overallAtAngle, batteryEnergyWh), tag);
@@ -233,8 +262,48 @@ fprintf('   overall DT eff : %.1f%%  ..  %.1f%%   (up from %.1f%% at the current
 fprintf('   battery saved  : %s  ..  %s  per endurance lap\n', ...
     battxt(1-overallEfficiencyCurrent/overall5degHalfshaft, batteryEnergyWh), ...
     battxt(1-overallEfficiencyCurrent/overallStraightHalfshaft, batteryEnergyWh));
-fprintf('   Getting OFF %.0f deg is the whole win; the exact angle in 0-5 is a packaging call.\n\n', ...
+fprintf('   Getting OFF %.0f deg is the whole win; the exact angle in 0-5 is a packaging call.\n', ...
     baselineStages.halfshaftAngleDeg);
+% TWO different percentages get quoted for this change -- print both, labelled, so
+% nobody mixes them up in a slide. EFFICIENCY GAIN is the multiplicative lift on
+% drivetrain efficiency; BATTERY SAVED is the smaller 1 - eff_now/eff_new number.
+hsNow = halfshaftEfficiency(baselineStages.halfshaftAngleDeg);
+fprintf('   Two ways of saying the same change -- do not mix them up:\n');
+fprintf('     EFFICIENCY GAIN (x on DT eff): %+.2f%% (12->5 deg)  %+.2f%% (12->0 deg)\n', ...
+    (halfshaftEfficiency(5)/hsNow - 1)*100, (halfshaftEfficiency(0)/hsNow - 1)*100);
+fprintf('     BATTERY SAVED  (per lap)     : %+.2f%% (12->5 deg)  %+.2f%% (12->0 deg)\n\n', ...
+    (1-overallEfficiencyCurrent/overall5degHalfshaft)*100, ...
+    (1-overallEfficiencyCurrent/overallStraightHalfshaft)*100);
+
+%% ============================================================================
+%% 3b. WHAT THIS MODEL DOES NOT PRICE  (read this before quoting the number above)
+%% ============================================================================
+% The honest boundary of the study: it prices the EFFICIENCY BENEFIT of straightening
+% the halfshafts and nothing else. Everything below is a real cost or caveat that this
+% model is silent on. Not quantified here on purpose -- we do not have the numbers, and
+% inventing them would be worse than saying so.
+fprintf('=== WHAT THIS MODEL DOES NOT PRICE ===\n');
+fprintf(' This study prices ONE thing: the efficiency gained by straightening the\n');
+fprintf(' halfshafts. It says NOTHING about what that repackaging costs elsewhere.\n');
+fprintf(' Moving the diff or the wheel centre to get the shafts flat also moves:\n');
+fprintf('   - ROLL CENTRE height and migration  -> open question for VD/chassis\n');
+fprintf('   - CG height (diff relocation)       -> open question for VD/chassis\n');
+fprintf('   - CAMBER GAIN / suspension kinematics through travel\n');
+fprintf('   - MOTION RATIO (spring/damper rates would need revisiting)\n');
+fprintf('   - packaging knock-ons: chassis nodes, driver cell, service access\n');
+fprintf(' None of these are modelled here and NONE are quantified -- they are questions\n');
+fprintf(' for VD/chassis, not numbers this tool can supply. A lap-time gain from\n');
+fprintf(' efficiency can be handed straight back by a worse roll centre.\n\n');
+fprintf(' ALSO NOT MODELLED -- BUMP/DROOP (suspension travel):\n');
+fprintf('   The halfshaft angle is NOT fixed at %d deg. It swings through the whole\n', ...
+    baselineStages.halfshaftAngleDeg);
+fprintf('   range of suspension travel, every bump and every corner. The loss model\n');
+fprintf('   1-2*k*sin(beta) is NONLINEAR in beta, so the travel-AVERAGED loss is not\n');
+fprintf('   the loss at the average angle -- averaging the angle first is not the same\n');
+fprintf('   as averaging the loss. This model evaluates at the static angle plus a\n');
+fprintf('   flat cornering term; it does not integrate over travel. Building that\n');
+fprintf('   needs a motion-ratio / travel-histogram model we do not have.\n');
+fprintf('   Direction of the error is NOT obvious -- do not assume it is small.\n\n');
 
 %% ============================================================================
 %% 4. FIGURES (one TABBED window, saved to output/)
@@ -250,10 +319,10 @@ overallVsAngle  = arrayfun(@(bb) overall(setf(baselineStages,'halfshaftAngleDeg'
 batterySavedVsAngle = (1 - overallEfficiencyCurrent./(overallVsAngle/100))*100;
 yyaxis(ax,'left');  plot(ax, halfshaftAngles, overallVsAngle,'-','LineWidth',1.8); ylabel(ax,'Overall drivetrain efficiency (%)');
 yyaxis(ax,'right'); plot(ax, halfshaftAngles, batterySavedVsAngle,'--','LineWidth',1.5); ylabel(ax,'Endurance battery saved (%)');
-xlabel(ax,'Halfshaft static angle (deg)  [MEASURE FROM CAD]'); grid(ax,'on'); xlim(ax,[0 12]);
+xlabel(ax,'Halfshaft static angle (deg)  [MEASURED from CAD]'); grid(ax,'on'); xlim(ax,[0 12]);
 try, xregion(ax,0,5,'FaceColor',[0.30 0.62 0.40],'FaceAlpha',0.12); catch, end
 xline(ax, baselineStages.halfshaftAngleDeg,'r:','LineWidth',1.3, ...
-    'Label',sprintf('placeholder %d°',baselineStages.halfshaftAngleDeg),'LabelOrientation','horizontal');
+    'Label',sprintf('measured %d°',baselineStages.halfshaftAngleDeg),'LabelOrientation','horizontal');
 title(ax,'Straighter halfshafts (shaded 0-5° = sweet spot)');
 
 % -- Tab: levers ranked by battery saved --
@@ -451,7 +520,8 @@ fprintf(' MOTOR+INVERTER is a MAP, not one number: peak (loaded) ~%.0f%%, in eff
 fprintf('   as-driven endurance AVERAGE %.0f%% (part-load, not a worn motor).\n\n', motorInverterEfficiency*100);
 
 fprintf('Sources: [1] CFR26_DT_Efficiency.pdf v4.0 (stage table + straight/corner time split).\n');
-fprintf('         Electrical end measured via the af/dteff method on July 11 telemetry.\n');
+fprintf('         Electrical end = measured pack-to-shaft efficiency (mech power out /\n');
+fprintf('         electrical power in, energy-weighted over motoring) on July 11 telemetry.\n');
 fprintf('         Diff LSD range from x-engineer / RoyMech / bevel-diff efficiency refs.\n');
 
 %% ============================== local functions ==============================
@@ -500,7 +570,15 @@ end
 
 function [asDrivenEfficiency, steadyStateEfficiency, batteryEnergyWh, durationMin, sourceNote, steadyCount, steadyPct] = ...
          measured_pack_to_shaft(csvPath)
-%MEASURED_PACK_TO_SHAFT  af/dteff motor+inverter efficiency from a telemetry CSV.
+%MEASURED_PACK_TO_SHAFT  Motor+inverter efficiency measured from a telemetry CSV.
+%   THE METHOD, in one line: efficiency = mechanical power OUT divided by electrical
+%   power IN, energy-weighted over the points where the car was actually motoring.
+%     mechanical power out = motor torque x rotational speed  (rear axle if we have
+%                            wheel-speed channels -- the gear ratio cancels either way)
+%     electrical power in  = pack voltage x pack current      (BMSB_packCurrent)
+%   Because the ratio cancels, this is a pack -> SHAFT number: motor + inverter only,
+%   with no drivetrain hardware in it.
+%
 %   asDrivenEfficiency    = energy-weighted sum(mech)/sum(pack) over MOTORING points
 %                           (part-load + transients -- what actually happened).
 %   steadyStateEfficiency = same but STEADY-STATE only (rpm & torque near-constant --
@@ -526,7 +604,7 @@ function [asDrivenEfficiency, steadyStateEfficiency, batteryEnergyWh, durationMi
     packVoltage = dataTable.BMSB_packVoltage;
     packCurrent = dataTable.BMSB_packCurrent;
     packPower       = abs(packVoltage .* packCurrent);
-    % ---- REAR-AXLE MECHANICAL POWER (Andrew) -------------------------------------
+    % ---- REAR-AXLE MECHANICAL POWER (speed from the wheel sensors, not the inverter) ----
     % Speed now comes from the REAR WHEEL SENSORS (mean of RL and RR) instead of the
     % inverter's motorSpeed; axle torque = motorTorque x gearRatio. This is a
     % SIGNAL-SOURCE change (trust the wheel sensor), not a number change:
@@ -534,7 +612,7 @@ function [asDrivenEfficiency, steadyStateEfficiency, batteryEnergyWh, durationMi
     %     rearWheelRPM, printed in the DATA USAGE block): axleTorque x axleSpeed then
     %     returns motor shaft power to within ~0.1% and the efficiency is unchanged.
     %   * That agreement is the POINT. The TRUE mechanical ratio is 15/30 spur x 30/13
-    %     chain = 4.6154 (gear_check.m; "4.61" is the shop rounding, -0.12%). The wheel
+    %     chain = 4.6154 (15/30 spur x 30/13 chain; "4.61" is the shop rounding, -0.12%). The wheel
     %     sensors measure 4.622, i.e. +0.14% off the true ratio -- so motor and rear
     %     tyres agree to about a tenth of a percent. No meaningful wheel slip.
     %   * Do NOT substitute p.gear_current (4.61) here: it is the ROUNDED number, and

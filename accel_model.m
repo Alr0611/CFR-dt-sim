@@ -19,6 +19,8 @@ fprintf('Wheel inertia %.4f kg*m^2 (%.1f kg, k=%.2f*r) | reflected @%.2f %.4f | 
     p.n_wheels*p.I_wheel/p.gear_current^2, p.I_rotor);
 
 %% ---- SWEEP: 0-75m and 0-100kph vs ratio ----
+% Run the full accel ODE at every candidate ratio and record the three numbers that
+% matter: time to 100 kph, time over 75 m, and the speed at the 75 m trap.
 % Study range 4.00-5.20 (same window as gear_ratio_optimization), at 0.05 for a smooth
 % curve, with p.gear_current forced ONTO the grid. Before this the grid was 3.6:0.05:5.4,
 % which does not contain 4.61 -- every "current" lookup below silently snapped to 4.60
@@ -44,6 +46,8 @@ fprintf('Model %.2fs at %.2f vs real clean launch 4.40s -> ~%.2fs conservative.\
     t75(jCur), gears(jCur), t75(jCur)-4.40);
 
 %% ---- WHEEL WEIGHT SENSITIVITY (@ current ratio) ----
+% What lighter wheels are worth. Mass comes off at the tread radius, so it counts twice:
+% less car to push AND less rotational inertia to spin up.
 fprintf('\n=== WHEEL WEIGHT SENSITIVITY @ %.2f:1 (mass removed at tread radius) ===\n', p.gear_current);
 for dkg = [0 0.25 0.5 0.75 1.0]
     ps = p; ps.m_car = p.m_car - 4*dkg; ps.I_wheel = p.I_wheel - dkg*p.r_wheel^2;
@@ -88,13 +92,41 @@ fprintf(' -> straightening 12 -> 0 deg is worth the last column; it is a HARDWAR
 fprintf('    (suspension/diff packaging), not a tune. Cross-check: drivetrain_efficiency\n');
 fprintf('    prices the same change in battery Wh over an endurance run.\n');
 
+%% ---- WHEEL RADIUS: free vs LOADED (the tyre squishes under load) ----
+% p.r_wheel is the FREE radius (tyre just sitting there). Under load the tyre
+% deflects and the rolling radius drops ~5% (params_cfr26 says so in the comment,
+% and we have never measured it on our own tyre). This matters more than it looks:
+% r sets rpm->speed AND the tractive force arm, so ~5% on radius is ~5% on force.
+% That is a bigger lever than the halfshaft angle. We do NOT change the value here
+% -- nobody has measured our loaded radius -- but the model should show what the
+% assumption is worth. If someone measures it, put the number in params, not here.
+fprintf('\n=== WHEEL RADIUS SENSITIVITY @ %.2f:1 (free vs loaded tyre) ===\n', p.gear_current);
+[~, t75_free, ~] = accel_run(p.gear_current, p);
+pLoaded = p;
+pLoaded.r_wheel = 0.95 * p.r_wheel;                                        % ~5% squish
+pLoaded.I_wheel = pLoaded.kFactor^2 * pLoaded.m_wheel * pLoaded.r_wheel^2;  % inertia follows r^2
+[~, t75_loaded, ~] = accel_run(p.gear_current, pLoaded);
+fprintf('  free radius   %.4f m -> 0-75m %.3f s   (what the model uses now)\n', p.r_wheel, t75_free);
+fprintf('  loaded 0.95x  %.4f m -> 0-75m %.3f s   (%+.3f s)\n', ...
+    pLoaded.r_wheel, t75_loaded, t75_loaded - t75_free);
+fprintf('  Measured clean launch was 4.40 s; the model sits %+.3f s off that at free radius.\n', ...
+    t75_free - 4.40);
+fprintf('  Loaded radius closes %.3f s of that %.3f s gap (~%.0f%%). So the free-radius\n', ...
+    t75_free - t75_loaded, t75_free - 4.40, 100*(t75_free - t75_loaded)/max(t75_free - 4.40, eps));
+fprintf('  assumption plausibly explains a chunk of the sim-vs-measured gap, but NOT all\n');
+fprintf('  of it. r_wheel is UNMEASURED under load -- this is a sensitivity, not a fix.\n');
+
 %% ---- 40-80 kph CORNER-EXIT RECOVERY ----
+% Standing-start accel is one event; most of a lap is accelerating out of corners.
+% This is that: full throttle from 40 to 80 kph, which is where gearing is really felt.
 fprintf('\n=== 40-80 kph recovery (full throttle, ideal TC) ===\n');
 for g = [4.0 4.2 p.gear_current 5.2]
     fprintf(' %.2f:1 -> %.2f s\n', g, recovery_40_80(g, p));
 end
 
 %% ---- FIGURES (one TABBED window, 4 tabs) ----
+% p0 is the same car with every rotational inertia zeroed -- the difference between the
+% two curves is exactly what spinning the rotor and wheels costs in 0-75 m.
 p0 = p; p0.I_rotor=0; p0.I_driveline=0; p0.I_wheel=0;
 t75_noI = nan(size(gears)); for i=1:numel(gears), [~,t75_noI(i),~]=accel_run(gears(i),p0); end
 
@@ -142,6 +174,20 @@ function [t100, t75, vtrap] = accel_run(G, p)
         for it=1:3
             Fzr = p.m_car*p.g*p.rear_static + p.m_car*a_prev*p.h_cg/p.L_wb + Fdown*p.rear_aero;
             Ftr = tire_mu_x(Fzr/2, p.tir) * Fzr;
+            % *** KNOWN BUG -- UNIT INCONSISTENCY IN THIS TRACTION CAP. NOT FIXED YET. ***
+            % T_M above already has eta_drivetrain applied, so it is post-loss shaft
+            % torque. The cap on the right divides by eta AGAIN, which inflates it by
+            % 1/eta = ~1.26x. Net effect: the traction limit is ~26% too high and
+            % therefore NEVER BINDS -- 0 of ~3726 integration steps to 75 m hit it.
+            % In consistent units the cap is Ftr*r_wheel*n (no /eta), and then ~1900
+            % of ~3720 steps ARE traction-capped and 0-75 m at 4.61:1 goes
+            % 4.669 -> 4.714 s. verify_math section 8 independently computes a
+            % traction-limited launch, which is the same disagreement showing up twice.
+            % CONSEQUENCE FOR ANYONE QUOTING THIS MODEL: any statement of the form
+            % "the launch is not traction-limited" or "grip does not affect accel" is
+            % an ARTIFACT OF THIS BUG, not a result. The grip sensitivity of 0-75 m is
+            % UNVERIFIED in both directions. OPEN -- pending launch/TC data.
+            % Left as-is deliberately so no number moves until that data lands.
             T_use = min(T_M, Ftr*p.r_wheel*n/p.eta_drivetrain);
             dwdt = (T_use - n*p.r_wheel*(b*w^2 + Cc) - p.T_F) / I_den;
             a_prev = p.r_wheel*n*dwdt;
